@@ -173,23 +173,29 @@ if uploaded:
         except Exception:
             pass  # maakt niet uit: fallback bestaat al
 
-    # 8) voer alle INSERTS in één keer uit (executescript ondersteunt multi-row)
+        # 8) voer alle INSERTS uit – multi-row veilig
     inserted_ok = 0
     if insert_sql_sqlite.strip():
-        try:
-            cur.executescript(insert_sql_sqlite)
-            conn.commit()
-            inserted_ok = 1
-        except Exception:
-            # als multi-row stukloopt, probeer ruwer te splitsen per ;
-            stmts = [s for s in insert_sql_sqlite.split(";") if s.strip()]
-            for s in stmts:
+        # we halen alle afzonderlijke INSERT-blokken (die kunnen heel lang zijn)
+        inserts = re.findall(r'(?is)(INSERT\s+INTO\s+["\']?wp_posts["\']?.*?;)', insert_sql_sqlite)
+        for ins in inserts:
+            stmt = ins.strip()
+            if not stmt:
+                continue
+            try:
+                cur.executescript(stmt)
+                conn.commit()
+                inserted_ok = 1
+            except Exception as e:
+                # kleine cleanup: als er \n middenin strings zitten, probeer te vervangen
+                stmt2 = stmt.replace("\\n", " ").replace("\\r", " ")
                 try:
-                    cur.executescript(s + ";")
+                    cur.executescript(stmt2)
                     conn.commit()
                     inserted_ok = 1
                 except Exception:
                     pass
+
 
     # 9) debug: lijst tabellen + aantal rows
     tables = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;", conn)
@@ -236,3 +242,4 @@ if uploaded:
         conn.close()
 else:
     st.info("⬆️ Upload een phpMyAdmin-export (.sql) om te beginnen.")
+
