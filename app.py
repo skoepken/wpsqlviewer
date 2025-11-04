@@ -1,14 +1,19 @@
 import streamlit as st
 import sqlite3, tempfile, os, re, pandas as pd
 
-st.set_page_config(page_title="WordPress Dump Viewer", layout="wide")
-st.title("📚 WordPress Dump Viewer – alleen wp_posts")
+st.set_page_config(page_title="WordPress SQL Viewer", layout="wide")
+st.title("📚 WordPress SQL Dump Viewer – wp_posts Extractor")
 
-st.write("Upload je volledige `.sql` export (phpMyAdmin). De app haalt automatisch **alleen wp_posts** (CREATE + INSERTS) eruit, zet het om naar SQLite en toont je posts/pagina’s.")
+st.write("""
+Upload een volledige `.sql` export uit phpMyAdmin of MariaDB.  
+De app haalt automatisch alleen de **wp_posts**-tabel (structuur + data) eruit,  
+maakt ze SQLite-compatibel en toont je posts en pagina’s.
+""")
 
 uploaded = st.file_uploader("Upload SQL-bestand", type=["sql"])
 
-# ---------- helpers ----------
+# ---------- hulpfuncties ----------
+
 CREATE_FALLBACK = """
 CREATE TABLE IF NOT EXISTS wp_posts (
   ID INTEGER PRIMARY KEY,
@@ -37,58 +42,44 @@ CREATE TABLE IF NOT EXISTS wp_posts (
 );
 """
 
-def extract_wp_posts_block(sql_text: str) -> str:
-    """
-    Neem de DROP/CREATE/INSERT stukken die specifiek op wp_posts slaan.
-    We laten alles als tekst en filteren puur op regels/blocks die wp_posts noemen.
-    """
-    # Verzamel alle regels die te maken hebben met wp_posts structuur + data
-    blocks = []
+def strip_mysql_comments(sql_text: str) -> str:
+    """Verwijder MySQL-specifieke /*!...*/ comments en LOCK/UNLOCK statements."""
+    s = re.sub(r"/\*![0-9]+.*?\*/;", "", sql_text, flags=re.DOTALL)
+    s = re.sub(r"LOCK TABLES .*?;", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"UNLOCK TABLES;", "", s, flags=re.IGNORECASE)
+    return s
 
-    # 1) DROP TABLE IF EXISTS `wp_posts`;
+def extract_wp_posts_block(sql_text: str) -> str:
+    """Neem de DROP/CREATE/INSERT stukken die specifiek op wp_posts slaan."""
+    blocks = []
+    # DROP
     drop_matches = re.findall(r"(?im)^DROP\s+TABLE\s+IF\s+EXISTS\s+[`'\"]?wp_posts[`'\"]?\s*;\s*", sql_text)
     blocks += drop_matches
-
-    # 2) CREATE TABLE `wp_posts` ( ... );
+    # CREATE
     create_match = re.search(
         r'(?is)CREATE\s+TABLE\s+[`\'"]?wp_posts[`\'"]?\s*\((.*?)\)\s*[^;]*;',
         sql_text
     )
     if create_match:
-        create_body = create_match.group(0)  # volledige CREATE incl. trailing ;)
-        blocks.append(create_body)
-
-    # 3) Alle INSERTs in wp_posts (multi-line toegestaan, tot de volgende ;)
+        blocks.append(create_match.group(0))
+    # INSERTS
     insert_matches = re.findall(
         r'(?is)INSERT\s+INTO\s+[`\'"]?wp_posts[`\'"]?.*?;',
         sql_text
     )
     blocks += insert_matches
-
     return "\n".join(blocks)
 
 def mysql_create_to_sqlite(create_sql: str) -> str:
-    """
-    Maak MySQL CREATE wp_posts compatibel met SQLite.
-    We bewerken ALLEEN het CREATE-statement (niet de INSERTS).
-    """
+    """Maak MySQL CREATE wp_posts compatibel met SQLite."""
     if not create_sql:
         return ""
-
-    s = create_sql
-
-    # backticks -> dubbele quotes
-    s = s.replace("`", '"')
-
-    # ENGINE/CHARSET/COLLATE/COMMENT/AUTO_INCREMENT tail meenemen
+    s = create_sql.replace("`", '"')
     s = re.sub(r"ENGINE\s*=\s*[^;]*;", ";", s, flags=re.IGNORECASE)
     s = re.sub(r"DEFAULT\s+CHARSET\s*=\s*[^;]*;", ";", s, flags=re.IGNORECASE)
     s = re.sub(r"COLLATE\s+[^\s;]+", "", s, flags=re.IGNORECASE)
     s = re.sub(r"AUTO_INCREMENT\s*=\s*\d+", "", s, flags=re.IGNORECASE)
     s = re.sub(r"COMMENT\s+'[^']*'", "", s, flags=re.IGNORECASE)
-
-    # Datatypen versimpelen (alleen in de kolom-definities)
-    # Let op: we wijzigen NIET de VALUES/INSERTs hier
     s = re.sub(r"\bbigint\s*\(\s*\d+\s*\)\s*unsigned", "INTEGER", s, flags=re.IGNORECASE)
     s = re.sub(r"\bint\s*\(\s*\d+\s*\)", "INTEGER", s, flags=re.IGNORECASE)
     s = re.sub(r"\btinyint\s*\(\s*\d+\s*\)\s*unsigned", "INTEGER", s, flags=re.IGNORECASE)
@@ -97,86 +88,57 @@ def mysql_create_to_sqlite(create_sql: str) -> str:
     s = re.sub(r"\btext\b", "TEXT", s, flags=re.IGNORECASE)
     s = re.sub(r"\bdatetime\b", "TEXT", s, flags=re.IGNORECASE)
     s = re.sub(r"\bunsigned\b", "", s, flags=re.IGNORECASE)
-
-    # KEY/INDEX regels die prefix-lengtes hebben -> simpeler of weg
-    # (SQLite kan ze negeren; ze zijn niet nodig om data te tonen)
-    # Verwijder volledige KEY/INDEX-regels
     s = re.sub(r"(?im)^\s*(UNIQUE\s+)?KEY\s+.*?,\s*$", "", s)
-
-    # PRIMARY KEY laten we staan
-    # Haal eventuele dubbele komma's op het einde weg
     s = re.sub(r",\s*(\)|PRIMARY|$)", r"\1", s)
-
-    # Zorg dat het eindigt met puntkomma
     if not s.strip().endswith(";"):
         s = s.rstrip() + ";"
-
-    # Herstel tabelnaam zonder quotes voor zekerheid
     s = re.sub(r'CREATE\s+TABLE\s+"wp_posts"', 'CREATE TABLE wp_posts', s, flags=re.IGNORECASE)
-
-    # Maak van AUTO_INCREMENT op kolom-niveau gewoon PRIMARY KEY (al gedaan via types)
     s = s.replace("AUTO_INCREMENT", "")
-
     return s
 
-def normalize_inserts(inserts_sql: str) -> str:
-    """
-    Inserts laten we grotendeels ongemoeid (best), maar:
-    - backticks naar dubbele quotes
-    - ON DUPLICATE KEY -> weg
-    - NO_AUTO_VALUE_ON_ZERO is al elders, niet relevant hier
-    """
-    s = inserts_sql.replace("`", '"')
+def normalize_inserts(s: str) -> str:
+    """Maak INSERTS iets veiliger voor SQLite."""
+    s = s.replace("`", '"')
     s = re.sub(r"ON\s+DUPLICATE\s+KEY\s+UPDATE.*?;", ";", s, flags=re.IGNORECASE|re.DOTALL)
+    s = strip_mysql_comments(s)
     return s
 
 # ---------- main ----------
 if uploaded:
     raw = uploaded.read().decode("utf-8", errors="ignore")
-
-    # 1) haal wp_posts DROP/CREATE/INSERTS uit het hele bestand
     wp_block = extract_wp_posts_block(raw)
     if not wp_block:
-        st.error("Kon de `wp_posts`-sectie niet vinden in dit bestand.")
+        st.error("Kon geen wp_posts-sectie vinden in dit bestand.")
         st.stop()
 
-    # 2) splits CREATE en INSERTs
     create_match = re.search(r'(?is)CREATE\s+TABLE\s+[`\'"]?wp_posts[`\'"]?\s*\(.*?\)\s*[^;]*;', wp_block)
     create_sql_mysql = create_match.group(0) if create_match else ""
-
     insert_sql_mysql = "\n".join(
         re.findall(r'(?is)INSERT\s+INTO\s+[`\'"]?wp_posts[`\'"]?.*?;', wp_block)
     )
 
-    # 3) zet CREATE om naar SQLite
     create_sql_sqlite = mysql_create_to_sqlite(create_sql_mysql)
-
-    # 4) normaliseer INSERTs
     insert_sql_sqlite = normalize_inserts(insert_sql_mysql)
 
-    # 5) maak tijdelijke sqlite db
     db = os.path.join(tempfile.gettempdir(), "wp_temp.db")
     if os.path.exists(db):
         os.remove(db)
     conn = sqlite3.connect(db)
     cur = conn.cursor()
 
-    # 6) zorg dat de tabel er ZEKER is
     cur.executescript(CREATE_FALLBACK)
     conn.commit()
 
-    # 7) voer de (geconverteerde) CREATE uit bovenop fallback (overbodige errors negeren)
     if create_sql_sqlite.strip():
         try:
             cur.executescript(create_sql_sqlite)
             conn.commit()
         except Exception:
-            pass  # maakt niet uit: fallback bestaat al
+            pass  # fallback bestaat al
 
-        # 8) voer alle INSERTS uit – multi-row veilig
+    # --- multi-row inserts correct uitvoeren ---
     inserted_ok = 0
     if insert_sql_sqlite.strip():
-        # we halen alle afzonderlijke INSERT-blokken (die kunnen heel lang zijn)
         inserts = re.findall(r'(?is)(INSERT\s+INTO\s+["\']?wp_posts["\']?.*?;)', insert_sql_sqlite)
         for ins in inserts:
             stmt = ins.strip()
@@ -186,8 +148,7 @@ if uploaded:
                 cur.executescript(stmt)
                 conn.commit()
                 inserted_ok = 1
-            except Exception as e:
-                # kleine cleanup: als er \n middenin strings zitten, probeer te vervangen
+            except Exception:
                 stmt2 = stmt.replace("\\n", " ").replace("\\r", " ")
                 try:
                     cur.executescript(stmt2)
@@ -196,8 +157,7 @@ if uploaded:
                 except Exception:
                     pass
 
-
-    # 9) debug: lijst tabellen + aantal rows
+    # --- debug: tabellen en rijen ---
     tables = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;", conn)
     st.caption("📋 Tabellen gevonden:")
     st.dataframe(tables)
@@ -206,9 +166,9 @@ if uploaded:
         count_df = pd.read_sql_query("SELECT COUNT(*) AS n FROM wp_posts;", conn)
         st.caption(f"🧮 Aantal rijen in wp_posts: {int(count_df.iloc[0]['n'])}")
     except Exception:
-        st.warning("wp_posts bestaat nog steeds niet. Dan ging CREATE of INSERT mis.")
+        st.warning("wp_posts bestaat nog steeds niet.")
 
-    # 10) toon posts/pagina's
+    # --- toon posts/pagina's ---
     try:
         df = pd.read_sql_query(
             """
@@ -221,9 +181,9 @@ if uploaded:
         )
         if df.empty:
             if inserted_ok == 0:
-                st.warning("Geen inserts uitgevoerd (dump bevatte mogelijk geen `INSERT INTO wp_posts`).")
+                st.warning("Geen INSERTS uitgevoerd (dump bevatte mogelijk geen data).")
             else:
-                st.warning("Geen posts/pagina’s gevonden (mogelijk alleen concepten of andere post_type). Probeer filter weg te halen.")
+                st.warning("Geen posts/pagina’s gevonden (mogelijk andere post_types).")
         else:
             st.subheader("📄 Posts & Pagina’s")
             st.dataframe(df)
@@ -242,4 +202,3 @@ if uploaded:
         conn.close()
 else:
     st.info("⬆️ Upload een phpMyAdmin-export (.sql) om te beginnen.")
-
